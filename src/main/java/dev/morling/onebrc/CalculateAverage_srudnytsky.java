@@ -1,26 +1,40 @@
+/*
+ *  Copyright 2023 The original authors
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
 package dev.morling.onebrc;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.RandomAccessFile;
+import java.io.*;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 public class CalculateAverage_srudnytsky {
     private static final String FILE = "measurements.txt";
 
     static class Stats {
-        double min = 100.0, max = -100.0, sum = 0.0;
-        long count = 0;
+        int min = 1000, max = -1000;
+        long sum = 0, count = 0;
 
-        void update(double val) {
-            min = Math.min(min, val);
-            max = Math.max(max, val);
+        void update(int val) {
+            if (val < min)
+                min = val;
+            if (val > max)
+                max = val;
             sum += val;
             count++;
         }
@@ -32,22 +46,23 @@ public class CalculateAverage_srudnytsky {
             count += other.count;
         }
 
+        @Override
         public String toString() {
-            return String.format(Locale.US, "%.1f/%.1f/%.1f", min, round(sum, count), max);
+            return String.format(Locale.US, "%.1f/%.1f/%.1f",
+                    min / 10.0, (Math.round((double) sum / count) / 10.0), max / 10.0);
         }
     }
 
-    private static double round(double sum, double count) {
-        double value = (Math.round(sum * 10.0) / 10.0) / count;
-        return Math.round(value * 10.0) / 10.0;
-    }
-
     public static void main(String[] args) throws Exception {
+        System.setOut(new PrintStream(new FileOutputStream(FileDescriptor.out), true, StandardCharsets.UTF_8));
         File file = new File(FILE);
         long length = file.length();
         int cores = Runtime.getRuntime().availableProcessors();
-        ExecutorService service = Executors.newFixedThreadPool(cores);
 
+        if (length < 1000000)
+            cores = 1;
+
+        ExecutorService service = Executors.newFixedThreadPool(cores);
         List<Future<Map<String, Stats>>> futures = new ArrayList<>();
         long chunkSize = length / cores;
 
@@ -59,10 +74,13 @@ public class CalculateAverage_srudnytsky {
                     raf.seek(end);
                     while (end < length && raf.read() != '\n')
                         end++;
+                    end = raf.getFilePointer();
                 }
                 long finalStart = start;
                 long finalEnd = end;
-                futures.add(service.submit(() -> process(finalStart, finalEnd)));
+                if (finalEnd > finalStart) {
+                    futures.add(service.submit(() -> processChunk(finalStart, finalEnd)));
+                }
                 start = end;
             }
 
@@ -70,49 +88,47 @@ public class CalculateAverage_srudnytsky {
             for (Future<Map<String, Stats>> f : futures) {
                 f.get().forEach((k, v) -> finalMap.computeIfAbsent(k, s -> new Stats()).merge(v));
             }
-            System.out.println(finalMap);
-        } finally {
+
+            System.out.println(finalMap.entrySet().stream()
+                    .map(e -> e.getKey() + "=" + e.getValue())
+                    .collect(Collectors.joining(", ", "{", "}")));
+        }
+        finally {
             service.shutdown();
         }
     }
 
-    private static Map<String, Stats> process(long start, long end) throws IOException {
-        Map<String, Stats> map = new HashMap<>(1000);
+    private static Map<String, Stats> processChunk(long start, long end) throws IOException {
+        Map<String, Stats> map = new HashMap<>(1024);
         try (RandomAccessFile raf = new RandomAccessFile(FILE, "r")) {
             MappedByteBuffer bb = raf.getChannel().map(FileChannel.MapMode.READ_ONLY, start, end - start);
-            byte[] nameBuf = new byte[100];
+            byte[] nameBuf = new byte[128];
 
             while (bb.hasRemaining()) {
                 int p = 0;
                 byte b;
-                while ((b = bb.get()) != ';')
+                while (bb.hasRemaining() && (b = bb.get()) != ';') {
                     nameBuf[p++] = b;
-
+                }
                 String name = new String(nameBuf, 0, p, StandardCharsets.UTF_8);
 
-                double temp = parseFast(bb);
-
-                map.computeIfAbsent(name, k -> new Stats()).update(temp);
+                int val = 0;
+                boolean neg = false;
+                while (bb.hasRemaining()) {
+                    b = bb.get();
+                    if (b == '-')
+                        neg = true;
+                    else if (b >= '0' && b <= '9')
+                        val = val * 10 + (b - '0');
+                    else if (b == '\n' || b == '\r') {
+                        if (b == '\r' && bb.hasRemaining() && bb.get(bb.position()) == '\n')
+                            bb.get();
+                        break;
+                    }
+                }
+                map.computeIfAbsent(name, k -> new Stats()).update(neg ? -val : val);
             }
         }
         return map;
-    }
-
-    private static double parseFast(MappedByteBuffer bb) {
-        int res = 0;
-        boolean neg = false;
-        byte b = bb.get();
-        if (b == '-') {
-            neg = true;
-            b = bb.get();
-        }
-        while (b != '\n') {
-            if (b >= '0' && b <= '9')
-                res = res * 10 + (b - '0');
-            if (!bb.hasRemaining())
-                break;
-            b = bb.get();
-        }
-        return (neg ? -res : res) / 10.0;
     }
 }
